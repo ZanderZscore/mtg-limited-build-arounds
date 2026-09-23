@@ -1,0 +1,5 @@
+# card_pair_win_rate.py uses only Python's standard library.
+# These dependencies are needed for the Streamlit app.
+streamlit>=1.35,<2
+pandas>=2.2,<3
+numpy>=1.26,<3
