@@ -107,7 +107,7 @@ $$
 
 ### Card Pair Statistics
 
-Selecting a card in the main table displays its individual pairings, sorted by synergy score from highest to lowest.
+Clicking on a card in the main table displays its individual pairings, sorted by synergy score from highest to lowest, in a second table underneath the first one.
 
 | Statistic                         | Description                                                                                                                                                                        |
 | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
