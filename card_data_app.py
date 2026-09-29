@@ -470,7 +470,7 @@ def show_app(data_dir: Path, explicit_csv: Path | None = None) -> None:
         search = st.text_input("Find a card", placeholder="Type part of a name…")
         st.caption(
             "Hover over card names to see card art. Click a row in the "
-            "first table to inspect its partners. Click column headings to sort."
+            "first table to inspect its partners in a second table below the first one. Click column headings to sort."
         )
         st.divider()
         st.markdown("**Definitions**")
@@ -520,6 +520,7 @@ def show_app(data_dir: Path, explicit_csv: Path | None = None) -> None:
 
     st.subheader(f"Cards — {dataset_label(selected_csv)}")
     st.caption(
+        "Click on a card (or row) to open a table below with all partners. "
         "Default sort: highest Build-Around Potential first. Mean WR is "
         "each card's actual individual GIH win rate, not an average over "
         "pairs. Games counts distinct games containing that card."
