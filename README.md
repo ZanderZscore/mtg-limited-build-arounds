@@ -4,8 +4,9 @@ An interactive Streamlit application for exploring card performance, card-pair s
 
 The application identifies cards whose performance improves substantially when they appear alongside particular other cards.
 
-Data is generated from the public datasets available from:
+A demo is availible at https://mtg-limited-build-arounds.streamlit.app/
 
+Data is generated from the public datasets available from:
 https://www.17lands.com/public_datasets
 
 Use the **Game Data** datasets.
@@ -359,16 +360,14 @@ Build-Around Potential attempts to identify cards whose strongest pairings perfo
 For each card:
 
 1. Calculate the Synergy Score with every eligible partner.
-2. Sort the pairings by Synergy Score.
-3. Select the highest 10%.
-4. Take their arithmetic mean.
+2. Find the highest Synergy Score.
 
 Conceptually:
 
 ```text
 Build-Around Potential(A)
     =
-mean(top 10% of Synergy(A, B))
+mean(top 1 of Synergy(A, B))
 ```
 
 For example, suppose the top synergy scores for a card are:

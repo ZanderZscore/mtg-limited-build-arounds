@@ -146,7 +146,7 @@ def calculate_statistics(
         return pd.Series(
             {
                 "variance": group["win_rate"].var(ddof=0),
-                "build_around": group["synergy"].nlargest(best_n).mean(),
+                "build_around": group["synergy"].max(),
                 "pair_count": len(group),
                 "best_partner": best_row["card_name_2"],
             }
@@ -475,8 +475,8 @@ def show_app(data_dir: Path, explicit_csv: Path | None = None) -> None:
         st.divider()
         st.markdown("**Definitions**")
         st.caption(
-            "Build-Around Potential = unweighted mean of the top 10% of "
-            "synergy scores for a card's eligible pairings (rounding up)."
+            "Build-Around Potential = the max "
+            "synergy score for a card's eligible pairings "
         )
         st.caption(
             "Synergy = pair WR − max(individual WR of card 1, "
