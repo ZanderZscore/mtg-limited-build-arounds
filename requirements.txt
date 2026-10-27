@@ -1,3 +1,4 @@
-streamlit==1.64.0
-pandas==3.0.6
-streamlit-aggrid==1.2.1.post2
+streamlit
+pandas
+streamlit-aggrid
+requests

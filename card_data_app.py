@@ -1,24 +1,6 @@
-"""MTG Build-Around Explorer.
-
-Repository layout for Streamlit Community Cloud:
-
-    .
-    ├── app.py
-    ├── requirements.txt
-    └── data/
-        ├── SOS_card_pairs.csv
-        ├── EOE_card_pairs.csv
-        └── ...
-
-Every CSV in data/ must contain:
-    card_name_1, card_name_2, win_rate, game_count
-
-Rows with card_name_1 == card_name_2 contain individual-card GIH stats.
-Other rows contain ordered pair statistics.
-"""
+"""MTG Build-Around Explorer with per-color-context adjusted synergy."""
 
 import argparse
-import math
 from pathlib import Path
 
 import pandas as pd
@@ -34,27 +16,59 @@ st.set_page_config(
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = BASE_DIR / "data"
-REQUIRED_COLUMNS = {"card_name_1", "card_name_2", "win_rate", "game_count"}
+
+BASE_REQUIRED_COLUMNS = {
+    "card_name_1",
+    "card_name_2",
+    "win_rate",
+    "game_count",
+}
+
+ADJUSTED_REQUIRED_COLUMNS = {
+    "color_context",
+    "context_pair_win_rate",
+    "context_pair_game_count",
+    "card_1_context_win_rate",
+    "card_1_context_game_count",
+    "card_2_context_win_rate",
+    "card_2_context_game_count",
+    "stronger_context_card_win_rate",
+    "adjusted_synergy",
+}
 
 
 def discover_datasets(data_dir: Path) -> list[Path]:
-    """Return all CSV datasets in data_dir, sorted by filename."""
     if not data_dir.exists():
         return []
+
     return sorted(
-        (p for p in data_dir.glob("*.csv") if p.is_file()),
-        key=lambda p: p.name.lower(),
+        (
+            path
+            for path in data_dir.glob("*.csv")
+            if path.is_file()
+        ),
+        key=lambda path: path.name.lower(),
     )
 
 
 def dataset_label(path: Path) -> str:
-    """Convert a CSV filename into a readable selector label."""
     label = path.stem
-    for suffix in ("_card_pair_win_rates", "_card_pairs", "_car_pairs"):
+
+    for suffix in (
+        "_card_pair_win_rates",
+        "_card_pairs",
+        "_car_pairs",
+    ):
         if label.lower().endswith(suffix):
             label = label[: -len(suffix)]
             break
-    return label.replace("_", " ").replace("-", " ").strip() or path.stem
+
+    return (
+        label.replace("_", " ")
+        .replace("-", " ")
+        .strip()
+        or path.stem
+    )
 
 
 @st.cache_data(show_spinner="Loading card data…")
@@ -62,38 +76,65 @@ def load_data(
     csv_path: str,
     file_mtime_ns: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load one generated card-pair CSV.
-
-    file_mtime_ns is part of the cache key so replacing a CSV locally
-    invalidates the cached result even when the filename is unchanged.
-    """
     del file_mtime_ns
 
-    data = pd.read_csv(
-        csv_path,
-        usecols=lambda col: col in REQUIRED_COLUMNS,
-        dtype={
-            "card_name_1": "string",
-            "card_name_2": "string",
-            "win_rate": "float64",
-            "game_count": "int64",
-        },
+    data = pd.read_csv(csv_path)
+
+    missing_base = BASE_REQUIRED_COLUMNS - set(data.columns)
+    if missing_base:
+        raise ValueError(
+            "CSV is missing required columns: "
+            + ", ".join(sorted(missing_base))
+        )
+
+    missing_adjusted = ADJUSTED_REQUIRED_COLUMNS - set(data.columns)
+    if missing_adjusted:
+        raise ValueError(
+            "This CSV was generated with an older preprocessing script. "
+            "Re-run card_pair_win_rate.py. Missing: "
+            + ", ".join(sorted(missing_adjusted))
+        )
+
+    numeric_columns = [
+        "win_rate",
+        "game_count",
+        "context_pair_win_rate",
+        "context_pair_game_count",
+        "card_1_context_win_rate",
+        "card_1_context_game_count",
+        "card_2_context_win_rate",
+        "card_2_context_game_count",
+        "stronger_context_card_win_rate",
+        "adjusted_synergy",
+    ]
+
+    for column in numeric_columns:
+        data[column] = pd.to_numeric(
+            data[column],
+            errors="coerce",
+        )
+
+    data = data.dropna(
+        subset=[
+            "card_name_1",
+            "card_name_2",
+            "win_rate",
+            "game_count",
+        ]
     )
 
-    missing = REQUIRED_COLUMNS - set(data.columns)
-    if missing:
-        raise ValueError(f"CSV is missing columns: {', '.join(sorted(missing))}")
-
-    data = data.dropna(subset=list(REQUIRED_COLUMNS))
     data = data.loc[
-        data["game_count"].gt(0) & data["win_rate"].between(0, 1)
+        data["game_count"].gt(0)
+        & data["win_rate"].between(0, 1)
     ].copy()
 
-    diagonal = data.loc[data["card_name_1"].eq(data["card_name_2"])].copy()
+    diagonal = data.loc[
+        data["card_name_1"].eq(data["card_name_2"])
+    ].copy()
+
     if diagonal["card_name_1"].duplicated().any():
         raise ValueError(
-            "Found duplicate individual-card rows "
-            "(card_name_1 == card_name_2)."
+            "Found duplicate individual-card rows."
         )
 
     individual = diagonal.rename(
@@ -104,67 +145,128 @@ def load_data(
         }
     )[["card", "individual_wr", "games"]]
 
-    pairs = data.loc[data["card_name_1"].ne(data["card_name_2"])].copy()
-    if pairs.duplicated(["card_name_1", "card_name_2"]).any():
-        raise ValueError("Found duplicate ordered card pairs in the CSV.")
+    pairs = data.loc[
+        data["card_name_1"].ne(data["card_name_2"])
+    ].copy()
+
+    # A pair can now legitimately appear multiple times, once per color context.
+    if pairs.duplicated(
+        ["card_name_1", "card_name_2", "color_context"]
+    ).any():
+        raise ValueError(
+            "Found duplicate ordered card-pair/color-context rows."
+        )
 
     return individual, pairs
 
 
-@st.cache_data(show_spinner="Calculating build-around statistics…")
 def calculate_statistics(
     individual: pd.DataFrame,
     pairs: pd.DataFrame,
+    min_adjusted_synergy: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Calculate card-level build-around stats and enriched pair stats."""
-    own = individual[["card", "individual_wr"]].rename(
-        columns={"card": "card_name_1", "individual_wr": "wr_1"}
+    """
+    min_adjusted_synergy is a decimal:
+        0.03 == +3 percentage points.
+
+    Only pair/context rows at or above the threshold contribute to:
+        * Build-Around Potential
+        * Pairings count
+        * Best Partner / Best Context
+        * the detail table
+    """
+    global_1 = individual[
+        ["card", "individual_wr"]
+    ].rename(
+        columns={
+            "card": "card_name_1",
+            "individual_wr": "wr_1_global",
+        }
     )
-    other = individual[["card", "individual_wr"]].rename(
-        columns={"card": "card_name_2", "individual_wr": "wr_2"}
+
+    global_2 = individual[
+        ["card", "individual_wr"]
+    ].rename(
+        columns={
+            "card": "card_name_2",
+            "individual_wr": "wr_2_global",
+        }
     )
 
     enriched = pairs.merge(
-        own, on="card_name_1", how="left", validate="many_to_one"
+        global_1,
+        on="card_name_1",
+        how="left",
+        validate="many_to_one",
     )
-    enriched = enriched.merge(
-        other, on="card_name_2", how="left", validate="many_to_one"
-    )
-    enriched = enriched.dropna(subset=["wr_1", "wr_2"]).copy()
 
-    enriched["improvement"] = enriched["win_rate"] - enriched["wr_1"]
-    enriched["synergy"] = (
-        enriched["win_rate"] - enriched[["wr_1", "wr_2"]].max(axis=1)
+    enriched = enriched.merge(
+        global_2,
+        on="card_name_2",
+        how="left",
+        validate="many_to_one",
     )
+
+    enriched["raw_synergy"] = (
+        enriched["win_rate"]
+        - enriched[
+            ["wr_1_global", "wr_2_global"]
+        ].max(axis=1)
+    )
+
+    eligible = enriched.dropna(
+        subset=["adjusted_synergy"]
+    ).copy()
+
+    eligible = eligible.loc[
+        eligible["adjusted_synergy"]
+        >= min_adjusted_synergy
+    ].copy()
 
     def summarize(group: pd.DataFrame) -> pd.Series:
-        # Every eligible pairing is weighted equally.
-        best_n = max(1, math.ceil(len(group) * 0.10))
-        best_row = group.sort_values(
-            ["synergy", "card_name_2"], ascending=[False, True]
+        best = group.sort_values(
+            [
+                "adjusted_synergy",
+                "context_pair_game_count",
+                "card_name_2",
+                "color_context",
+            ],
+            ascending=[
+                False,
+                False,
+                True,
+                True,
+            ],
         ).iloc[0]
+
+        # Pairings counts pair/context rows, not unique partner names,
+        # because the same partner may qualify in multiple contexts.
         return pd.Series(
             {
-                "variance": group["win_rate"].var(ddof=0),
-                "build_around": group["synergy"].max(),
+                "variance": group["adjusted_synergy"].var(ddof=0),
+                "build_around": best["adjusted_synergy"],
                 "pair_count": len(group),
-                "best_partner": best_row["card_name_2"],
+                "unique_partner_count": group["card_name_2"].nunique(),
+                "best_partner": best["card_name_2"],
+                "best_context": best["color_context"],
             }
         )
 
-    if enriched.empty:
+    if eligible.empty:
         summaries = pd.DataFrame(
             columns=[
                 "card_name_1",
                 "variance",
                 "build_around",
                 "pair_count",
+                "unique_partner_count",
                 "best_partner",
+                "best_context",
             ]
         )
     else:
         summaries = (
-            enriched.groupby("card_name_1", sort=False)
+            eligible.groupby("card_name_1", sort=False)
             .apply(summarize, include_groups=False)
             .reset_index()
         )
@@ -176,41 +278,46 @@ def calculate_statistics(
         how="left",
     ).drop(columns="card_name_1")
 
-    summary["pair_count"] = summary["pair_count"].fillna(0).astype(int)
+    summary["pair_count"] = (
+        summary["pair_count"]
+        .fillna(0)
+        .astype(int)
+    )
+
+    summary["unique_partner_count"] = (
+        summary["unique_partner_count"]
+        .fillna(0)
+        .astype(int)
+    )
+
     summary = summary.sort_values(
         ["build_around", "card"],
         ascending=[False, True],
         na_position="last",
     ).reset_index(drop=True)
 
-    return summary, enriched
+    return summary, eligible
 
 
-# Keep card art OUT of React rendering. Returning an HTMLElement from a
-# cellRenderer can trigger React error #31 in streamlit-aggrid. These callbacks
-# leave the grid cell as plain text and create a temporary overlay in the grid
-# iframe's document.body instead.
 SHOW_CARD_PREVIEW = JsCode(r"""
 function(params) {
     const hoverFields = ['Card', 'Best Partner', 'Paired Card'];
     const field = params.column ? params.column.getColId() : null;
+
     if (!hoverFields.includes(field)) return;
 
     const name = params.value;
     if (typeof name !== 'string' || !name.trim()) return;
 
-    function clearPreview() {
-        if (window.mtgCardPreviewTimer) {
-            clearTimeout(window.mtgCardPreviewTimer);
-            window.mtgCardPreviewTimer = null;
-        }
-        if (window.mtgCardPreview) {
-            window.mtgCardPreview.remove();
-            window.mtgCardPreview = null;
-        }
+    if (window.mtgCardPreviewTimer) {
+        clearTimeout(window.mtgCardPreviewTimer);
+        window.mtgCardPreviewTimer = null;
     }
 
-    clearPreview();
+    if (window.mtgCardPreview) {
+        window.mtgCardPreview.remove();
+        window.mtgCardPreview = null;
+    }
 
     const mouseX = params.event ? params.event.clientX : 0;
     const mouseY = params.event ? params.event.clientY : 0;
@@ -219,8 +326,6 @@ function(params) {
         window.mtgCardPreviewTimer = null;
 
         const popup = document.createElement('div');
-        popup.setAttribute('role', 'tooltip');
-        popup.setAttribute('aria-label', name + ' card image');
         popup.style.position = 'fixed';
         popup.style.zIndex = '2147483647';
         popup.style.pointerEvents = 'none';
@@ -236,8 +341,11 @@ function(params) {
         image.style.width = '100%';
         image.style.height = 'auto';
         image.style.borderRadius = '8px';
-        image.src = 'https://api.scryfall.com/cards/named' +
-            '?format=image&version=normal&exact=' + encodeURIComponent(name);
+
+        image.src =
+            'https://api.scryfall.com/cards/named'
+            + '?format=image&version=normal&exact='
+            + encodeURIComponent(name);
 
         image.onerror = function() {
             popup.replaceChildren();
@@ -245,7 +353,6 @@ function(params) {
             message.textContent = 'Card image unavailable: ' + name;
             message.style.color = 'white';
             message.style.padding = '8px';
-            message.style.fontSize = '13px';
             popup.appendChild(message);
         };
 
@@ -255,18 +362,21 @@ function(params) {
         const popupWidth = 260;
         const popupHeight = 365;
         const margin = 8;
+
         let left = mouseX + 18;
         let top = mouseY + 12;
 
         if (left + popupWidth > window.innerWidth - margin) {
             left = mouseX - popupWidth - 18;
         }
+
         if (top + popupHeight > window.innerHeight - margin) {
             top = window.innerHeight - popupHeight - margin;
         }
 
         popup.style.left = Math.max(margin, left) + 'px';
         popup.style.top = Math.max(margin, top) + 'px';
+
         window.mtgCardPreview = popup;
     }, 250);
 }
@@ -279,6 +389,7 @@ function(params) {
         clearTimeout(window.mtgCardPreviewTimer);
         window.mtgCardPreviewTimer = null;
     }
+
     if (window.mtgCardPreview) {
         window.mtgCardPreview.remove();
         window.mtgCardPreview = null;
@@ -295,9 +406,13 @@ def card_grid(
     height: int,
     selectable: bool = False,
 ):
-    """Render a sortable AG Grid with card-art hover previews."""
     builder = GridOptionsBuilder.from_dataframe(data)
-    builder.configure_default_column(sortable=True, resizable=True, filter=True)
+
+    builder.configure_default_column(
+        sortable=True,
+        resizable=True,
+        filter=True,
+    )
 
     hover_style = {
         "cursor": "help",
@@ -320,7 +435,16 @@ def card_grid(
             flex=2,
         )
 
-    for field in ("Mean WR", "Pair WR", "Individual WR (Partner)"):
+    percent_fields = (
+        "Mean WR",
+        "Pair WR",
+        "Context Pair WR",
+        "Card WR in Context",
+        "Partner WR in Context",
+        "Stronger Card WR in Context",
+    )
+
+    for field in percent_fields:
         if field in data.columns:
             builder.configure_column(
                 field,
@@ -333,10 +457,16 @@ def card_grid(
                     }
                     """
                 ),
-                minWidth=125,
+                minWidth=135,
             )
 
-    for field in ("Build-Around Potential", "Synergy Score", "WR Improvement"):
+    pp_fields = (
+        "Build-Around Potential",
+        "Adjusted Synergy",
+        "Raw Synergy",
+    )
+
+    for field in pp_fields:
         if field in data.columns:
             builder.configure_column(
                 field,
@@ -345,11 +475,12 @@ def card_grid(
                     function(p) {
                         if (p.value == null) return '';
                         const v = Number(p.value);
-                        return (v > 0 ? '+' : '') + v.toFixed(2) + ' pp';
+                        return (v > 0 ? '+' : '')
+                            + v.toFixed(2) + ' pp';
                     }
                     """
                 ),
-                minWidth=145,
+                minWidth=150,
             )
 
     if "Variance" in data.columns:
@@ -367,7 +498,12 @@ def card_grid(
             minWidth=105,
         )
 
-    for field in ("Games", "Pairings"):
+    for field in (
+        "Games",
+        "Pair Contexts",
+        "Unique Partners",
+        "Context Pair Games",
+    ):
         if field in data.columns:
             builder.configure_column(
                 field,
@@ -380,11 +516,14 @@ def card_grid(
                     }
                     """
                 ),
-                minWidth=105,
+                minWidth=115,
             )
 
     if selectable:
-        builder.configure_selection(selection_mode="single", use_checkbox=False)
+        builder.configure_selection(
+            selection_mode="single",
+            use_checkbox=False,
+        )
 
     grid_options = builder.build()
     grid_options["rowHeight"] = 36
@@ -407,7 +546,6 @@ def card_grid(
 
 
 def selected_card_from_grid(result) -> str | None:
-    """Extract the selected Card across streamlit-aggrid return shapes."""
     rows = getattr(result, "selected_rows", None)
 
     if rows is None:
@@ -423,26 +561,29 @@ def selected_card_from_grid(result) -> str | None:
 
     if isinstance(rows, list) and rows:
         row = rows[0]
+
         if isinstance(row, dict) and "Card" in row:
             return str(row["Card"])
 
     return None
 
 
-def choose_dataset(data_dir: Path, explicit_csv: Path | None) -> Path:
-    """Render the dataset selector and return the chosen CSV."""
+def choose_dataset(
+    data_dir: Path,
+    explicit_csv: Path | None,
+) -> Path:
     if explicit_csv is not None:
         if not explicit_csv.exists():
             st.error(f"CSV does not exist: {explicit_csv}")
             st.stop()
+
         return explicit_csv
 
     datasets = discover_datasets(data_dir)
+
     if not datasets:
         st.error(
-            f"No CSV files found in `{data_dir}`.\n\n"
-            "Create a `data/` directory next to app.py and place one or "
-            "more generated card-pair CSVs in it."
+            f"No CSV files found in `{data_dir}`."
         )
         st.stop()
 
@@ -451,85 +592,130 @@ def choose_dataset(data_dir: Path, explicit_csv: Path | None) -> Path:
         options=datasets,
         index=0,
         format_func=dataset_label,
-        help="Every CSV in the repository's data/ directory appears here.",
+        help="Every CSV in data/ appears here.",
         disabled=len(datasets) == 1,
     )
 
 
-def show_app(data_dir: Path, explicit_csv: Path | None = None) -> None:
+def show_app(
+    data_dir: Path,
+    explicit_csv: Path | None = None,
+) -> None:
     st.title("MTG Build-Around Explorer")
+
     st.caption(
-        "Individual game-in-hand win rates, upper-tail synergy, "
-        "and card-pair win rates"
+        "Individual GIH win rates and per-color-context "
+        "card-pair synergy"
     )
 
     with st.sidebar:
         st.header("Explore")
-        selected_csv = choose_dataset(data_dir, explicit_csv)
-        st.caption(f"Source: `{selected_csv.name}`")
-        search = st.text_input("Find a card", placeholder="Type part of a name…")
-        st.caption(
-            "Hover over card names to see card art. Click a row in the "
-            "first table to inspect its partners in a second table below the first one. Click column headings to sort."
+
+        selected_csv = choose_dataset(
+            data_dir,
+            explicit_csv,
         )
+
+        st.caption(f"Source: `{selected_csv.name}`")
+
+        min_synergy_pp = st.number_input(
+            "Minimum Adjusted Synergy (pp)",
+            min_value=-50.0,
+            max_value=50.0,
+            value=3.0,
+            step=0.5,
+            help=(
+                "Only pair/color-context rows at or above this "
+                "Adjusted Synergy are shown and used in the "
+                "Build-Around Potential ranking."
+            ),
+        )
+
+        search = st.text_input(
+            "Find a card",
+            placeholder="Type part of a name…",
+        )
+
+        st.caption(
+            "Hover over card names to see card art. "
+            "Click a row to inspect its qualifying pair/context rows."
+        )
+
         st.divider()
         st.markdown("**Definitions**")
+
         st.caption(
-            "Build-Around Potential = the max "
-            "synergy score for a card's eligible pairings "
+            "Adjusted Synergy = pair WR inside one main_colors "
+            "context − the higher of the two cards' individual WRs "
+            "inside that same context."
         )
+
         st.caption(
-            "Synergy = pair WR − max(individual WR of card 1, "
-            "individual WR of card 2)."
+            "Each qualifying main_colors context is reported separately. "
+            "The same partner can therefore appear more than once."
         )
+
         st.caption(
-            "Variance = unweighted population variance of a card's pair "
-            "win rates, in percentage-points squared."
-        )
-        st.caption(
-            "These are observed associations, not proof that one card "
-            "causes another to win more."
+            "Build-Around Potential = the single highest Adjusted "
+            "Synergy score among rows meeting the selected threshold."
         )
 
     try:
         individual, pairs = load_data(
-            str(selected_csv), selected_csv.stat().st_mtime_ns
+            str(selected_csv),
+            selected_csv.stat().st_mtime_ns,
         )
-    except (OSError, ValueError, pd.errors.ParserError) as exc:
-        st.error(f"Could not load `{selected_csv.name}`: {exc}")
+    except (
+        OSError,
+        ValueError,
+        pd.errors.ParserError,
+    ) as exc:
+        st.error(
+            f"Could not load `{selected_csv.name}`: {exc}"
+        )
         st.stop()
 
     if individual.empty:
-        st.error(
-            "No individual-card rows found "
-            "(card_name_1 == card_name_2)."
-        )
+        st.error("No individual-card rows found.")
         st.stop()
 
-    summary, enriched = calculate_statistics(individual, pairs)
+    summary, eligible = calculate_statistics(
+        individual,
+        pairs,
+        min_adjusted_synergy=min_synergy_pp / 100.0,
+    )
 
     view = summary.copy()
+
     if search:
         view = view.loc[
-            view["card"].str.contains(search, case=False, regex=False, na=False)
+            view["card"].str.contains(
+                search,
+                case=False,
+                regex=False,
+                na=False,
+            )
         ]
 
     if view.empty:
         st.info("No cards match the search.")
         return
 
-    st.subheader(f"Cards — {dataset_label(selected_csv)}")
+    st.subheader(
+        f"Cards — {dataset_label(selected_csv)}"
+    )
+
     st.caption(
-        "Click on a card (or row) to open a table below with all partners. "
-        "Default sort: highest Build-Around Potential first. Mean WR is "
-        "each card's actual individual GIH win rate, not an average over "
-        "pairs. Games counts distinct games containing that card."
+        f"Only pair/context rows with Adjusted Synergy ≥ "
+        f"{min_synergy_pp:.1f} pp contribute to this table."
     )
 
     display = view.copy()
+
     display["individual_wr"] *= 100
     display["build_around"] *= 100
     display["variance"] *= 10000
+
     display = display.rename(
         columns={
             "card": "Card",
@@ -537,100 +723,160 @@ def show_app(data_dir: Path, explicit_csv: Path | None = None) -> None:
             "variance": "Variance",
             "build_around": "Build-Around Potential",
             "games": "Games",
-            "pair_count": "Pairings",
+            "pair_count": "Pair Contexts",
+            "unique_partner_count": "Unique Partners",
             "best_partner": "Best Partner",
+            "best_context": "Best Context",
         }
     )[
         [
             "Card",
             "Mean WR",
-            "Variance",
             "Build-Around Potential",
+            "Variance",
             "Games",
-            "Pairings",
+            "Pair Contexts",
+            "Unique Partners",
             "Best Partner",
+            "Best Context",
         ]
     ].reset_index(drop=True)
 
     dataset_key = selected_csv.stem.replace(" ", "_")
+
     picked = card_grid(
         display,
         name_column="Card",
-        key=f"card_selection_{dataset_key}",
+        key=(
+            f"card_selection_{dataset_key}_"
+            f"{min_synergy_pp:.2f}"
+        ),
         height=510,
         selectable=True,
     )
 
-    st.caption(
-        "Variance is expressed in percentage-points squared. Build-Around "
-        "Potential is measured in percentage points (pp)."
-    )
-
     selected_name = selected_card_from_grid(picked)
+
     if selected_name is None:
         st.info(
-            "Select a card in the table above to inspect its pairings. "
-            "Hover over a card name to see its art."
+            "Select a card above to inspect its qualifying pairings."
         )
         return
 
-    selected_rows = view.loc[view["card"].eq(selected_name)]
+    selected_rows = view.loc[
+        view["card"].eq(selected_name)
+    ]
+
     if selected_rows.empty:
-        st.info("Select a card from the currently displayed rows.")
+        st.info(
+            "Select a card from the currently displayed rows."
+        )
         return
+
     selected = selected_rows.iloc[0]
 
     st.divider()
     st.subheader(f"Pairings for {selected_name}")
 
     a, b, c = st.columns(3)
-    a.metric("Individual GIH WR", f"{selected['individual_wr']:.2%}")
+
+    a.metric(
+        "Individual GIH WR",
+        f"{selected['individual_wr']:.2%}",
+    )
+
     b.metric(
         "Build-Around Potential",
-        "N/A"
-        if pd.isna(selected["build_around"])
-        else f"{selected['build_around'] * 100:+.2f} pp",
+        (
+            "N/A"
+            if pd.isna(selected["build_around"])
+            else f"{selected['build_around'] * 100:+.2f} pp"
+        ),
     )
-    c.metric("Unique Games", f"{int(selected['games']):,}")
 
-    detail = enriched.loc[
-        enriched["card_name_1"].eq(selected_name)
+    c.metric(
+        "Unique Games",
+        f"{int(selected['games']):,}",
+    )
+
+    detail = eligible.loc[
+        eligible["card_name_1"].eq(selected_name)
     ].copy()
+
     if detail.empty:
-        st.info("No eligible pairings for this card.")
+        st.info(
+            f"No pair/color-context rows for this card meet "
+            f"the {min_synergy_pp:.1f} pp threshold."
+        )
         return
 
     detail = detail.sort_values(
-        ["synergy", "game_count"], ascending=[False, False]
+        [
+            "adjusted_synergy",
+            "context_pair_game_count",
+            "card_name_2",
+            "color_context",
+        ],
+        ascending=[
+            False,
+            False,
+            True,
+            True,
+        ],
     )
-    detail["Synergy Score"] = detail["synergy"] * 100
-    detail["Pair WR"] = detail["win_rate"] * 100
-    detail["WR Improvement"] = detail["improvement"] * 100
-    detail["Individual WR (Partner)"] = detail["wr_2"] * 100
+
+    detail["Adjusted Synergy"] = (
+        detail["adjusted_synergy"] * 100
+    )
+
+    detail["Raw Synergy"] = (
+        detail["raw_synergy"] * 100
+    )
+
+    detail["Context Pair WR"] = (
+        detail["context_pair_win_rate"] * 100
+    )
+
+    detail["Card WR in Context"] = (
+        detail["card_1_context_win_rate"] * 100
+    )
+
+    detail["Partner WR in Context"] = (
+        detail["card_2_context_win_rate"] * 100
+    )
+
     detail = detail.rename(
-        columns={"card_name_2": "Paired Card", "game_count": "Games"}
+        columns={
+            "card_name_2": "Paired Card",
+            "color_context": "Color Context",
+            "context_pair_game_count": "Context Pair Games",
+            "game_count": "Games",
+        }
     )
 
     st.caption(
-        "Default sort: highest Synergy Score first. WR Improvement compares "
-        "the pair to the selected card; Synergy Score compares it to the "
-        "stronger individual card. Both are in percentage points."
+        "The same Paired Card can appear in multiple rows when it "
+        "qualifies in multiple main_colors contexts."
     )
 
     card_grid(
         detail[
             [
                 "Paired Card",
-                "Synergy Score",
-                "Pair WR",
-                "WR Improvement",
-                "Individual WR (Partner)",
-                "Games",
+                "Adjusted Synergy",
+                "Color Context",
+                "Context Pair WR",
+                "Card WR in Context",
+                "Partner WR in Context",
+                "Context Pair Games",
             ]
         ].reset_index(drop=True),
         name_column="Paired Card",
-        key=f"pair_grid_{dataset_key}_{selected_name}",
-        height=620,
+        key=(
+            f"pair_grid_{dataset_key}_"
+            f"{selected_name}_{min_synergy_pp:.2f}"
+        ),
+        height=650,
     )
 
 
@@ -638,24 +884,26 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Streamlit MTG build-around explorer"
     )
+
     parser.add_argument(
         "--data-dir",
         default=str(DEFAULT_DATA_DIR),
-        help="Directory containing card-pair CSV files (default: ./data)",
     )
+
     parser.add_argument(
         "--csv",
         default=None,
-        help=(
-            "Optional single CSV override. If omitted, the app shows a "
-            "selector for every CSV in --data-dir."
-        ),
     )
+
     arguments, _ = parser.parse_known_args()
 
     show_app(
-        data_dir=Path(arguments.data_dir).expanduser().resolve(),
+        data_dir=Path(
+            arguments.data_dir
+        ).expanduser().resolve(),
         explicit_csv=(
-            Path(arguments.csv).expanduser().resolve() if arguments.csv else None
+            Path(arguments.csv).expanduser().resolve()
+            if arguments.csv
+            else None
         ),
     )
